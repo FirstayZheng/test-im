@@ -40,6 +40,7 @@ env:
   PR: ${{ github.event.pull_request.number }}
   SID: pr-review-${{ github.event.pull_request.number }}
   WORK: /tmp/agentkit-review
+  CODEX_TIMEOUT_SECONDS: 600
 
 jobs:
   review:
@@ -119,7 +120,7 @@ jobs:
           # 3) Run codex non-interactively; -o writes ONLY its final message to a
           #    file (no reasoning noise). Single quotes keep `$(cat …)` for the
           #    sandbox shell, so the prompt is read inside the sandbox.
-          agentkit sandbox run -s "$SID" $TOOL_FLAG $MODEL_FLAGS \
+          agentkit sandbox run --timeout "$CODEX_TIMEOUT_SECONDS" -s "$SID" $TOOL_FLAG $MODEL_FLAGS \
             'codex exec --skip-git-repo-check -o /tmp/agentkit-review/review_out.md "$(cat /tmp/agentkit-review/prompt.txt)" >/dev/null 2>&1; echo done'
           # 4) Download the review file.
           agentkit sandbox cp ":$WORK/review_out.md" review.md -s "$SID" $TOOL_FLAG --overwrite
@@ -151,15 +152,15 @@ jobs:
           echo "sandbox upload state for session: $SID"
           agentkit sandbox run -s "$SID" $TOOL_FLAG "echo remote hostname=\$(hostname); echo remote time=\$(date -Is); echo workdir; ls -la $WORK || true; echo upload temp files; ls -la /tmp/agentkit-upload-* 2>/dev/null || true; echo running tar processes; ps -ef | grep '[t]ar' || true; echo inspect upload archives; for f in /tmp/agentkit-upload-*; do [ -e \"\$f\" ] || continue; echo file=\$f; ls -l \"\$f\"; stat \"\$f\" || true; file \"\$f\" || true; if command -v timeout >/dev/null 2>&1; then timeout 5 tar -tf \"\$f\" > /tmp/agentkit-tar-list.txt; status=\$?; else tar -tf \"\$f\" > /tmp/agentkit-tar-list.txt; status=\$?; fi; echo tar_list_status=\$status; head -20 /tmp/agentkit-tar-list.txt 2>/dev/null || true; done" || true
 
-      # Tear down the session so sandboxes don't pile up (best-effort).
-      - name: Clean up sandbox session
+      # Keep the session temporarily so failed runs can be inspected in-place.
+      - name: Keep sandbox session for debugging
         if: always() && steps.guard.outputs.skip != 'true'
         run: |
           TOOL_FLAG="--auto-create"
           [ -n "$SANDBOX_TOOL_ID" ] && TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
           if [ -n "$SANDBOX_TOOL_ID" ]; then
-            echo "cleaning sandbox session with tool id: $SANDBOX_TOOL_ID"
+            echo "keeping sandbox session with tool id: $SANDBOX_TOOL_ID"
           else
-            echo "cleaning sandbox session with --auto-create"
+            echo "keeping sandbox session with --auto-create"
           fi
-          agentkit sandbox rm "$SID" $TOOL_FLAG -y || true
+          echo "sandbox session retained for debugging: $SID"
