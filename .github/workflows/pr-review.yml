@@ -1,0 +1,131 @@
+# AI code review: on every pull request, run OpenAI Codex inside an AgentKit
+# code sandbox over the PR diff and post the review as a PR comment.
+#
+# Required repo secrets / variables (Settings → Secrets and variables → Actions):
+#   VOLCENGINE_ACCESS_KEY, VOLCENGINE_SECRET_KEY   # AgentKit sandbox credentials
+#   SANDBOX_TOOL_ID    (variable)                  # pre-created code-sandbox tool
+# Optional repo variables / secrets:
+#   VOLCENGINE_REGION  (variable, default: cn-beijing)
+#   CODEX_MODEL        (variable) + MODEL_API_KEY (secret) — only if you want the
+#                      sandbox codex to use a specific model instead of its default.
+#
+# Note: PRs from forks do NOT receive repo secrets, so this workflow only runs
+# for same-repository PRs (it skips gracefully otherwise). Do not switch to
+# `pull_request_target` unless you fully trust the incoming code.
+name: pr-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# One review per PR; a new push cancels the in-flight one.
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  VOLCENGINE_ACCESS_KEY: ${{ secrets.VOLCENGINE_ACCESS_KEY }}
+  VOLCENGINE_SECRET_KEY: ${{ secrets.VOLCENGINE_SECRET_KEY }}
+  VOLCENGINE_REGION: ${{ vars.VOLCENGINE_REGION || 'cn-beijing' }}
+  SANDBOX_TOOL_ID: ${{ vars.SANDBOX_TOOL_ID }}
+  # Optional: leave unset to use the sandbox codex's default model.
+  CODEX_MODEL: ${{ vars.CODEX_MODEL }}
+  MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+  GH_TOKEN: ${{ github.token }}
+  PR: ${{ github.event.pull_request.number }}
+  SID: pr-review-${{ github.event.pull_request.number }}
+  WORK: /tmp/agentkit-review
+  CODEX_TIMEOUT_SECONDS: 600
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      # Fork PRs (and repos without the secrets set) can't reach the sandbox —
+      # skip the rest of the job cleanly rather than failing red.
+      - name: Check credentials
+        id: guard
+        run: |
+          if [ -z "$VOLCENGINE_ACCESS_KEY" ] || [ -z "$VOLCENGINE_SECRET_KEY" ]; then
+            echo "sandbox credentials unavailable (fork PR or secrets unset) — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ -z "$SANDBOX_TOOL_ID" ]; then
+            echo "SANDBOX_TOOL_ID repository variable is required for pr-review"
+            exit 1
+          fi
+
+      # Standalone binary, no Node needed — puts `agentkit`/`ak` on PATH.
+      - name: Install agentkit CLI
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          curl -fsSL https://agentkit-cli.tos-cn-beijing.volces.com/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Assemble the full review prompt = instructions + the PR diff.
+      - name: Assemble review prompt
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          gh pr diff "$PR" --repo "${{ github.repository }}" > pr.diff
+          # Keep the prompt within model limits (adjust as needed).
+          head -c 120000 pr.diff > pr.diff.trim && mv pr.diff.trim pr.diff
+          {
+            echo "You are a senior code reviewer. Review the unified diff below and"
+            echo "write a concise review in GitHub-flavored Markdown with these sections:"
+            echo "Summary, Potential bugs, Security/Performance, Style nits. Reference file"
+            echo "paths and hunks. If the change looks good, say so briefly. Output ONLY the review."
+            echo
+            echo '```diff'
+            cat pr.diff
+            echo '```'
+          } > prompt.txt
+          echo "prompt bytes: $(wc -c < prompt.txt)"
+
+      - name: Review with codex in the sandbox
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          set -e
+          TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
+          echo "sandbox tool id: $SANDBOX_TOOL_ID"
+          # Optional model override; otherwise the sandbox codex uses its default.
+          MODEL_FLAGS=""
+          [ -n "$MODEL_API_KEY" ] && MODEL_FLAGS="$MODEL_FLAGS --model-api-key $MODEL_API_KEY"
+          [ -n "$CODEX_MODEL" ] && MODEL_FLAGS="$MODEL_FLAGS --model-name $CODEX_MODEL"
+
+          # 1) Create (or reuse) a code sandbox + session (codex is preinstalled).
+          agentkit sandbox run -s "$SID" $TOOL_FLAG --type code "mkdir -p $WORK && echo ready"
+          # 2) Upload the prompt. The remote side is a directory, matching the
+          #    documented `agentkit sandbox cp ./local.txt :/work/` form.
+          if ! agentkit sandbox cp prompt.txt ":$WORK/" -s "$SID" $TOOL_FLAG; then
+            echo "sandbox cp reported failure; verifying whether prompt.txt landed"
+            agentkit sandbox run -s "$SID" $TOOL_FLAG "test -s $WORK/prompt.txt"
+          fi
+          # 3) Run codex non-interactively; -o writes ONLY its final message to a
+          #    file (no reasoning noise). Single quotes keep `$(cat …)` for the
+          #    sandbox shell, so the prompt is read inside the sandbox.
+          agentkit sandbox run --timeout "$CODEX_TIMEOUT_SECONDS" -s "$SID" $TOOL_FLAG $MODEL_FLAGS \
+            'codex exec --skip-git-repo-check -o /tmp/agentkit-review/review_out.md "$(cat /tmp/agentkit-review/prompt.txt)" >/dev/null 2>&1; echo done'
+          # 4) Download the review file.
+          agentkit sandbox cp ":$WORK/review_out.md" review.md -s "$SID" $TOOL_FLAG --overwrite
+          test -s review.md || echo "_Codex produced no output for this diff._" > review.md
+
+      - name: Post review comment
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          {
+            echo "🤖 **Codex sandbox review**"
+            echo
+            cat review.md
+          } > comment.md
+          gh pr comment "$PR" --repo "${{ github.repository }}" --body-file comment.md
+
+      # Tear down the session so sandboxes don't pile up (best-effort).
+      - name: Clean up sandbox session
+        if: always() && steps.guard.outputs.skip != 'true'
+        run: |
+          TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
+          echo "cleaning sandbox session with tool id: $SANDBOX_TOOL_ID"
+          agentkit sandbox rm "$SID" $TOOL_FLAG -y || true
