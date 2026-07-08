@@ -98,12 +98,21 @@ jobs:
           MODEL_FLAGS=""
           [ -n "$MODEL_API_KEY" ] && MODEL_FLAGS="$MODEL_FLAGS --model-api-key $MODEL_API_KEY"
           [ -n "$CODEX_MODEL" ] && MODEL_FLAGS="$MODEL_FLAGS --model-name $CODEX_MODEL"
+          echo "session id: $SID"
+          echo "remote work dir: $WORK"
+          echo "local prompt file:"
+          ls -l prompt.txt
+          echo "local prompt bytes: $(wc -c < prompt.txt)"
 
           # 1) Create (or reuse) a code sandbox + session (codex is preinstalled).
           agentkit sandbox run -s "$SID" $TOOL_FLAG --type code "mkdir -p $WORK && echo ready"
+          # Print remote diagnostics before upload. This helps distinguish CLI
+          # upload failures from sandbox image, path, and instance issues.
+          agentkit sandbox run -s "$SID" $TOOL_FLAG "echo remote hostname=\$(hostname); echo remote etc-hostname=\$(cat /etc/hostname 2>/dev/null || true); echo remote user=\$(whoami); echo remote pwd=\$(pwd); id; ls -ld /tmp $WORK; command -v tar || true; tar --version 2>/dev/null | head -n 1 || true; command -v gzip || true; gzip --version 2>/dev/null | head -n 1 || true; df -h /tmp || true; echo workdir listing before upload; ls -la $WORK || true; echo recent agentkit upload temp files; ls -la /tmp/agentkit-upload-* 2>/dev/null || true"
           # 2) Upload the prompt. The remote side is a directory, matching the
           #    documented `agentkit sandbox cp ./local.txt :/work/` form.
           agentkit sandbox cp prompt.txt ":$WORK/" -s "$SID" $TOOL_FLAG
+          agentkit sandbox run -s "$SID" $TOOL_FLAG "echo workdir listing after upload; ls -la $WORK; wc -c $WORK/prompt.txt; head -c 120 $WORK/prompt.txt | sed 's/[^[:print:][:space:]]/?/g'; echo"
           # 3) Run codex non-interactively; -o writes ONLY its final message to a
           #    file (no reasoning noise). Single quotes keep `$(cat …)` for the
           #    sandbox shell, so the prompt is read inside the sandbox.
@@ -122,6 +131,14 @@ jobs:
             cat review.md
           } > comment.md
           gh pr comment "$PR" --repo "${{ github.repository }}" --body-file comment.md
+
+      - name: Show sandbox logs
+        if: failure() && steps.guard.outputs.skip != 'true'
+        run: |
+          TOOL_FLAG="--auto-create"
+          [ -n "$SANDBOX_TOOL_ID" ] && TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
+          echo "sandbox logs for session: $SID"
+          agentkit sandbox logs "$SID" $TOOL_FLAG --tail 200 || true
 
       # Tear down the session so sandboxes don't pile up (best-effort).
       - name: Clean up sandbox session
