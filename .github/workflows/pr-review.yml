@@ -111,7 +111,10 @@ jobs:
           agentkit sandbox run -s "$SID" $TOOL_FLAG "echo remote hostname=\$(hostname); echo remote etc-hostname=\$(cat /etc/hostname 2>/dev/null || true); echo remote user=\$(whoami); echo remote pwd=\$(pwd); id; ls -ld /tmp $WORK; command -v tar || true; tar --version 2>/dev/null | head -n 1 || true; command -v gzip || true; gzip --version 2>/dev/null | head -n 1 || true; df -h /tmp || true; echo workdir listing before upload; ls -la $WORK || true; echo recent agentkit upload temp files; ls -la /tmp/agentkit-upload-* 2>/dev/null || true"
           # 2) Upload the prompt. The remote side is a directory, matching the
           #    documented `agentkit sandbox cp ./local.txt :/work/` form.
-          agentkit sandbox cp prompt.txt ":$WORK/" -s "$SID" $TOOL_FLAG
+          if ! agentkit sandbox cp prompt.txt ":$WORK/" -s "$SID" $TOOL_FLAG; then
+            echo "sandbox cp reported failure; verifying whether prompt.txt landed"
+            agentkit sandbox run -s "$SID" $TOOL_FLAG "test -s $WORK/prompt.txt"
+          fi
           agentkit sandbox run -s "$SID" $TOOL_FLAG "echo workdir listing after upload; ls -la $WORK; wc -c $WORK/prompt.txt; head -c 120 $WORK/prompt.txt | sed 's/[^[:print:][:space:]]/?/g'; echo"
           # 3) Run codex non-interactively; -o writes ONLY its final message to a
           #    file (no reasoning noise). Single quotes keep `$(cat …)` for the
