@@ -140,6 +140,14 @@ jobs:
           echo "sandbox logs for session: $SID"
           agentkit sandbox logs "$SID" $TOOL_FLAG --tail 200 || true
 
+      - name: Inspect sandbox upload state
+        if: failure() && steps.guard.outputs.skip != 'true'
+        run: |
+          TOOL_FLAG="--auto-create"
+          [ -n "$SANDBOX_TOOL_ID" ] && TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
+          echo "sandbox upload state for session: $SID"
+          agentkit sandbox run -s "$SID" $TOOL_FLAG "echo remote hostname=\$(hostname); echo remote time=\$(date -Is); echo workdir; ls -la $WORK || true; echo upload temp files; ls -la /tmp/agentkit-upload-* 2>/dev/null || true; echo running tar processes; ps -ef | grep '[t]ar' || true; echo inspect upload archives; for f in /tmp/agentkit-upload-*; do [ -e \"\$f\" ] || continue; echo file=\$f; ls -l \"\$f\"; stat \"\$f\" || true; file \"\$f\" || true; if command -v timeout >/dev/null 2>&1; then timeout 5 tar -tf \"\$f\" > /tmp/agentkit-tar-list.txt; status=\$?; else tar -tf \"\$f\" > /tmp/agentkit-tar-list.txt; status=\$?; fi; echo tar_list_status=\$status; head -20 /tmp/agentkit-tar-list.txt 2>/dev/null || true; done" || true
+
       # Tear down the session so sandboxes don't pile up (best-effort).
       - name: Clean up sandbox session
         if: always() && steps.guard.outputs.skip != 'true'
