@@ -89,6 +89,11 @@ jobs:
           # sandboxes), else let the CLI create/select one.
           TOOL_FLAG="--auto-create"
           [ -n "$SANDBOX_TOOL_ID" ] && TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
+          if [ -n "$SANDBOX_TOOL_ID" ]; then
+            echo "sandbox tool id: $SANDBOX_TOOL_ID"
+          else
+            echo "sandbox tool id: unset; using --auto-create"
+          fi
           # Optional model override; otherwise the sandbox codex uses its default.
           MODEL_FLAGS=""
           [ -n "$MODEL_API_KEY" ] && MODEL_FLAGS="$MODEL_FLAGS --model-api-key $MODEL_API_KEY"
@@ -124,4 +129,9 @@ jobs:
         run: |
           TOOL_FLAG="--auto-create"
           [ -n "$SANDBOX_TOOL_ID" ] && TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
+          if [ -n "$SANDBOX_TOOL_ID" ]; then
+            echo "cleaning sandbox session with tool id: $SANDBOX_TOOL_ID"
+          else
+            echo "cleaning sandbox session with --auto-create"
+          fi
           agentkit sandbox rm "$SID" $TOOL_FLAG -y || true
