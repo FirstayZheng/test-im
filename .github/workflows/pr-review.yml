@@ -1,12 +1,11 @@
 # AI code review: on every pull request, run OpenAI Codex inside an AgentKit
 # code sandbox over the PR diff and post the review as a PR comment.
 #
-# Required repo secrets (Settings → Secrets and variables → Actions):
+# Required repo secrets / variables (Settings → Secrets and variables → Actions):
 #   VOLCENGINE_ACCESS_KEY, VOLCENGINE_SECRET_KEY   # AgentKit sandbox credentials
+#   SANDBOX_TOOL_ID    (variable)                  # pre-created code-sandbox tool
 # Optional repo variables / secrets:
 #   VOLCENGINE_REGION  (variable, default: cn-beijing)
-#   SANDBOX_TOOL_ID    (variable) — pin a specific code-sandbox tool. Needed when
-#                      the project has more than one; otherwise --auto-create is used.
 #   CODEX_MODEL        (variable) + MODEL_API_KEY (secret) — only if you want the
 #                      sandbox codex to use a specific model instead of its default.
 #
@@ -54,6 +53,9 @@ jobs:
           if [ -z "$VOLCENGINE_ACCESS_KEY" ] || [ -z "$VOLCENGINE_SECRET_KEY" ]; then
             echo "sandbox credentials unavailable (fork PR or secrets unset) — skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ -z "$SANDBOX_TOOL_ID" ]; then
+            echo "SANDBOX_TOOL_ID repository variable is required for pr-review"
+            exit 1
           fi
 
       # Standalone binary, no Node needed — puts `agentkit`/`ak` on PATH.
@@ -86,37 +88,21 @@ jobs:
         if: steps.guard.outputs.skip != 'true'
         run: |
           set -e
-          # Pin a tool if provided (required when the project has multiple code
-          # sandboxes), else let the CLI create/select one.
-          TOOL_FLAG="--auto-create"
-          [ -n "$SANDBOX_TOOL_ID" ] && TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
-          if [ -n "$SANDBOX_TOOL_ID" ]; then
-            echo "sandbox tool id: $SANDBOX_TOOL_ID"
-          else
-            echo "sandbox tool id: unset; using --auto-create"
-          fi
+          TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
+          echo "sandbox tool id: $SANDBOX_TOOL_ID"
           # Optional model override; otherwise the sandbox codex uses its default.
           MODEL_FLAGS=""
           [ -n "$MODEL_API_KEY" ] && MODEL_FLAGS="$MODEL_FLAGS --model-api-key $MODEL_API_KEY"
           [ -n "$CODEX_MODEL" ] && MODEL_FLAGS="$MODEL_FLAGS --model-name $CODEX_MODEL"
-          echo "session id: $SID"
-          echo "remote work dir: $WORK"
-          echo "local prompt file:"
-          ls -l prompt.txt
-          echo "local prompt bytes: $(wc -c < prompt.txt)"
 
           # 1) Create (or reuse) a code sandbox + session (codex is preinstalled).
           agentkit sandbox run -s "$SID" $TOOL_FLAG --type code "mkdir -p $WORK && echo ready"
-          # Print remote diagnostics before upload. This helps distinguish CLI
-          # upload failures from sandbox image, path, and instance issues.
-          agentkit sandbox run -s "$SID" $TOOL_FLAG "echo remote hostname=\$(hostname); echo remote etc-hostname=\$(cat /etc/hostname 2>/dev/null || true); echo remote user=\$(whoami); echo remote pwd=\$(pwd); id; ls -ld /tmp $WORK; command -v tar || true; tar --version 2>/dev/null | head -n 1 || true; command -v gzip || true; gzip --version 2>/dev/null | head -n 1 || true; df -h /tmp || true; echo workdir listing before upload; ls -la $WORK || true; echo recent agentkit upload temp files; ls -la /tmp/agentkit-upload-* 2>/dev/null || true"
           # 2) Upload the prompt. The remote side is a directory, matching the
           #    documented `agentkit sandbox cp ./local.txt :/work/` form.
           if ! agentkit sandbox cp prompt.txt ":$WORK/" -s "$SID" $TOOL_FLAG; then
             echo "sandbox cp reported failure; verifying whether prompt.txt landed"
             agentkit sandbox run -s "$SID" $TOOL_FLAG "test -s $WORK/prompt.txt"
           fi
-          agentkit sandbox run -s "$SID" $TOOL_FLAG "echo workdir listing after upload; ls -la $WORK; wc -c $WORK/prompt.txt; head -c 120 $WORK/prompt.txt | sed 's/[^[:print:][:space:]]/?/g'; echo"
           # 3) Run codex non-interactively; -o writes ONLY its final message to a
           #    file (no reasoning noise). Single quotes keep `$(cat …)` for the
           #    sandbox shell, so the prompt is read inside the sandbox.
@@ -136,31 +122,10 @@ jobs:
           } > comment.md
           gh pr comment "$PR" --repo "${{ github.repository }}" --body-file comment.md
 
-      - name: Show sandbox logs
-        if: failure() && steps.guard.outputs.skip != 'true'
-        run: |
-          TOOL_FLAG="--auto-create"
-          [ -n "$SANDBOX_TOOL_ID" ] && TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
-          echo "sandbox logs for session: $SID"
-          agentkit sandbox logs "$SID" $TOOL_FLAG --tail 200 || true
-
-      - name: Inspect sandbox upload state
-        if: failure() && steps.guard.outputs.skip != 'true'
-        run: |
-          TOOL_FLAG="--auto-create"
-          [ -n "$SANDBOX_TOOL_ID" ] && TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
-          echo "sandbox upload state for session: $SID"
-          agentkit sandbox run -s "$SID" $TOOL_FLAG "echo remote hostname=\$(hostname); echo remote time=\$(date -Is); echo workdir; ls -la $WORK || true; echo upload temp files; ls -la /tmp/agentkit-upload-* 2>/dev/null || true; echo running tar processes; ps -ef | grep '[t]ar' || true; echo inspect upload archives; for f in /tmp/agentkit-upload-*; do [ -e \"\$f\" ] || continue; echo file=\$f; ls -l \"\$f\"; stat \"\$f\" || true; file \"\$f\" || true; if command -v timeout >/dev/null 2>&1; then timeout 5 tar -tf \"\$f\" > /tmp/agentkit-tar-list.txt; status=\$?; else tar -tf \"\$f\" > /tmp/agentkit-tar-list.txt; status=\$?; fi; echo tar_list_status=\$status; head -20 /tmp/agentkit-tar-list.txt 2>/dev/null || true; done" || true
-
-      # Keep the session temporarily so failed runs can be inspected in-place.
-      - name: Keep sandbox session for debugging
+      # Tear down the session so sandboxes don't pile up (best-effort).
+      - name: Clean up sandbox session
         if: always() && steps.guard.outputs.skip != 'true'
         run: |
-          TOOL_FLAG="--auto-create"
-          [ -n "$SANDBOX_TOOL_ID" ] && TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
-          if [ -n "$SANDBOX_TOOL_ID" ]; then
-            echo "keeping sandbox session with tool id: $SANDBOX_TOOL_ID"
-          else
-            echo "keeping sandbox session with --auto-create"
-          fi
-          echo "sandbox session retained for debugging: $SID"
+          TOOL_FLAG="--tool-id $SANDBOX_TOOL_ID"
+          echo "cleaning sandbox session with tool id: $SANDBOX_TOOL_ID"
+          agentkit sandbox rm "$SID" $TOOL_FLAG -y || true
